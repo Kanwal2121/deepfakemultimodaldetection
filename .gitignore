@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Large Files (Models & Data)
+*.h5
+*.keras
+*.csv
+FaceForensics++_C23/
+FakeAVCeleb/
+eval_results/
+calibration.json
+visual_training_log.csv
+*.task
+*.tflite
+
+# Artifacts & Local Files
+.DS_Store
+artifacts/
+deprecated/
+gradcam_frame_*.png
+confusion_matrix.png
+
+# PyCharm / VS Code
+.idea/
+.vscode/

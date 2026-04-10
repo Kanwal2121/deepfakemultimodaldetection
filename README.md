@@ -182,9 +182,7 @@ GANs leave characteristic spectral fingerprints:
 
 These features are combined into a heuristic anomaly score without requiring any neural network training.
 
-## 🏆 Built For
 
-**Hexagon Hackathon** — Cybersecurity & AI Track
 
 ---
 
