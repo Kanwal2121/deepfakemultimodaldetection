@@ -23,6 +23,55 @@ from frequency_analyzer import analyze_video_frequency
 from lip_sync_analyzer import LipSyncAnalyzer
 from preprocess_utils import extract_and_crop_faces, extract_mel_spectrogram
 
+
+# ══════════════════════════════════════════════════════════════════
+#  Custom Keras Objects (Required for loading pre-trained models)
+# ══════════════════════════════════════════════════════════════════
+
+class FocalLoss(tf.keras.losses.Loss):
+    def __init__(self, gamma=2.0, alpha=0.75, label_smoothing=0.05, **kwargs):
+        super().__init__(**kwargs)
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        if self.label_smoothing > 0:
+            y_true = y_true * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        bce = -(y_true * tf.math.log(y_pred) + (1 - y_true) * tf.math.log(1 - y_pred))
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        focal_weight = tf.pow(1.0 - p_t, self.gamma)
+        alpha_t = y_true * self.alpha + (1 - y_true) * (1 - self.alpha)
+        return tf.reduce_mean(alpha_t * focal_weight * bce)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"gamma": self.gamma, "alpha": self.alpha, "label_smoothing": self.label_smoothing})
+        return config
+
+
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, initial_lr, warmup_steps, total_steps, min_lr=1e-7, **kwargs):
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_lr = self.initial_lr * (step / tf.maximum(self.warmup_steps, 1.0))
+        decay_steps = tf.maximum(self.total_steps - self.warmup_steps, 1.0)
+        cosine_decay = 0.5 * (1.0 + tf.cos(np.pi * (step - self.warmup_steps) / decay_steps))
+        decay_lr = self.min_lr + (self.initial_lr - self.min_lr) * cosine_decay
+        return tf.where(step < self.warmup_steps, warmup_lr, decay_lr)
+
+    def get_config(self):
+        return {"initial_lr": self.initial_lr, "warmup_steps": self.warmup_steps, "total_steps": self.total_steps, "min_lr": self.min_lr}
+
+
 DEFAULT_CALIBRATION = {
     "visual_real_threshold": 0.5,
     "audio_real_threshold": 0.5,
@@ -36,9 +85,11 @@ def _load_model(path_options):
         if not os.path.exists(path):
             continue
         try:
-            return tf.keras.models.load_model(path), path
+            custom_objects = {"FocalLoss": FocalLoss, "WarmupCosineDecay": WarmupCosineDecay}
+            return tf.keras.models.load_model(path, custom_objects=custom_objects, compile=False), path
         except Exception:
             continue
+
     raise FileNotFoundError(f"Unable to load model from: {path_options}")
 
 
@@ -127,14 +178,16 @@ def detect_deepfake(video_path, json_out=None):
         fused_real_prob = 0.75 * vis_real_prob + 0.25 * (1.0 - freq_anomaly)
     else:
         # All 4 experts contribute, weighted by their confidence
-        conf_s = max(0.1, abs(sync_score - 0.5) * 2)
-        conf_f = max(0.1, abs(freq_anomaly - 0.5) * 2)
+        # All 4 experts contribute, weighted by their confidence
+        conf_s = _confidence(sync_score)
+        conf_f = _confidence(1.0 - freq_anomaly)
         total_conf = vis_conf + aud_conf + conf_s + conf_f + 1e-8
-
+        
         w_v = vis_conf / total_conf
         w_a = aud_conf / total_conf
         w_s = conf_s / total_conf
         w_f = conf_f / total_conf
+
 
         fused_real_prob = (
             w_v * vis_real_prob

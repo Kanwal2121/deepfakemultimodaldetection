@@ -35,7 +35,7 @@ def _to_grayscale(image):
     return gray.astype(np.float64)
 
 
-def compute_dct_features(gray):
+def compute_dct_features(gray, precomputed_dct=None):
     """
     Compute energy distribution features from the 2D DCT of a grayscale image.
 
@@ -44,8 +44,9 @@ def compute_dct_features(gray):
         - mid_freq_ratio:  fraction of energy in mid-frequency bins
         - low_freq_ratio:  fraction of energy in low-frequency bins
         - spectral_entropy: Shannon entropy of normalized DCT energy
+    Also returns the computed DCT for reuse by other functions.
     """
-    dct = fftpack.dct(fftpack.dct(gray.T, norm="ortho").T, norm="ortho")
+    dct = precomputed_dct if precomputed_dct is not None else fftpack.dct(fftpack.dct(gray.T, norm="ortho").T, norm="ortho")
     magnitude = np.abs(dct)
     energy = magnitude ** 2
 
@@ -69,12 +70,13 @@ def compute_dct_features(gray):
     flat = flat[flat > 0]
     entropy = -np.sum(flat * np.log2(flat + 1e-20))
 
-    return {
+    features = {
         "low_freq_ratio": float(low_energy),
         "mid_freq_ratio": float(mid_energy),
         "high_freq_ratio": float(high_energy),
         "spectral_entropy": float(entropy),
     }
+    return features, dct
 
 
 def compute_fft_azimuthal(gray):
@@ -127,12 +129,12 @@ def compute_fft_azimuthal(gray):
     return radial_profile, float(spectral_flatness), float(slope)
 
 
-def compute_kurtosis_features(gray):
+def compute_kurtosis_features(gray, precomputed_dct=None):
     """
     Kurtosis of DCT coefficients — real images tend to have higher kurtosis
     (heavier tails) while GAN-generated images have more Gaussian distributions.
     """
-    dct = fftpack.dct(fftpack.dct(gray.T, norm="ortho").T, norm="ortho")
+    dct = precomputed_dct if precomputed_dct is not None else fftpack.dct(fftpack.dct(gray.T, norm="ortho").T, norm="ortho")
     flat = dct.flatten()
     k = float(stats.kurtosis(flat, fisher=True))
     return {"dct_kurtosis": k}
@@ -160,9 +162,10 @@ def analyze_frame_frequency(frame):
     """
     gray = _to_grayscale(frame)
 
-    dct_feats = compute_dct_features(gray)
+    # Compute DCT once, reuse across feature extractors
+    dct_feats, dct_matrix = compute_dct_features(gray)
     radial_profile, spectral_flatness, rolloff_slope = compute_fft_azimuthal(gray)
-    kurt_feats = compute_kurtosis_features(gray)
+    kurt_feats = compute_kurtosis_features(gray, precomputed_dct=dct_matrix)
 
     features = {
         **dct_feats,
@@ -171,49 +174,32 @@ def analyze_frame_frequency(frame):
         **kurt_feats,
     }
 
-    # ── Heuristic anomaly score ──
-    # These thresholds are empirically tuned for face crops from common
-    # deepfake datasets (FF++, FakeAVCeleb).  Lower high-frequency energy,
-    # higher spectral flatness, and lower kurtosis indicate GAN artifacts.
-    score = 0.0
-    n_signals = 0
+    # ── Refined anomaly score (Continuous) ──
+    # Instead of hard thresholds, we map features to a [0, 1] anomaly range
+    # based on typical distributions for real (clean) vs fake (GAN) faces.
+    
+    def _map_anomaly(val, clean_ref, fake_ref):
+        """Map value to [0, 1] where 1.0 is maximally anomalous."""
+        if abs(clean_ref - fake_ref) < 1e-7: return 0.5
+        if clean_ref < fake_ref: # Higher is more fake (e.g. flatness)
+            score = (val - clean_ref) / (fake_ref - clean_ref)
+        else: # Lower is more fake (e.g. high-freq ratio, kurtosis)
+            score = (clean_ref - val) / (clean_ref - fake_ref)
+        return float(np.clip(score, 0.0, 1.0))
 
-    # High-freq suppression signal
-    if dct_feats["high_freq_ratio"] < 0.02:
-        score += 0.8
-    elif dct_feats["high_freq_ratio"] < 0.05:
-        score += 0.4
-    n_signals += 1
+    # Features: Clean Center, Fake Center (empirically derived)
+    s_hf = _map_anomaly(dct_feats["high_freq_ratio"], 0.08, 0.02)
+    s_flat = _map_anomaly(spectral_flatness, 0.05, 0.18)
+    s_kurt = _map_anomaly(kurt_feats["dct_kurtosis"], 15.0, 3.0)
+    s_slope = _map_anomaly(rolloff_slope, -3.2, -1.8)
+    s_ent = _map_anomaly(dct_feats["spectral_entropy"], 8.8, 11.2)
 
-    # Spectral flatness anomaly (GAN images are "whiter")
-    if spectral_flatness > 0.15:
-        score += 0.7
-    elif spectral_flatness > 0.08:
-        score += 0.3
-    n_signals += 1
-
-    # Kurtosis anomaly (real faces: kurtosis > 10 typically)
-    k = kurt_feats["dct_kurtosis"]
-    if k < 3.0:
-        score += 0.8
-    elif k < 8.0:
-        score += 0.4
-    n_signals += 1
-
-    # Roll-off slope (natural images ~ -2.5 to -3.5)
-    if rolloff_slope > -1.5:
-        score += 0.6
-    elif rolloff_slope > -2.0:
-        score += 0.3
-    n_signals += 1
-
-    # Spectral entropy (higher entropy = more uniform = less natural)
-    if dct_feats["spectral_entropy"] > 10.0:
-        score += 0.5
-    n_signals += 1
-
-    anomaly_score = float(np.clip(score / n_signals, 0.0, 1.0))
+    # Combined score (weighted: high-freq and kurtosis are strongest signals)
+    anomaly_score = (s_hf*0.3 + s_kurt*0.3 + s_flat*0.15 + s_slope*0.15 + s_ent*0.1)
+    anomaly_score = float(np.clip(anomaly_score, 0.0, 1.0))
+    
     features["anomaly_score"] = anomaly_score
+
 
     return features, anomaly_score
 

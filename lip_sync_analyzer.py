@@ -36,17 +36,19 @@ class LipSyncAnalyzer:
                 raise
 
     def compute_mouth_openness(self, landmarks, frame_shape):
-        """Calculate Mouth Aspect Ratio (MAR) using standard landmarks."""
+        """Calculate Mouth Aspect Ratio (MAR) normalized by inter-ocular distance (IOD)."""
         h, w, _ = frame_shape
         # Inner lip centers: 13 (top), 14 (bottom)
         p13, p14 = landmarks[13], landmarks[14]
         h_dist = np.sqrt(((p13.x - p14.x) * w)**2 + ((p13.y - p14.y) * h)**2)
         
-        # Outer lip corners: 61 (left), 291 (right)
-        p61, p291 = landmarks[61], landmarks[291]
-        w_dist = np.sqrt(((p61.x - p291.x) * w)**2 + ((p61.y - p291.y) * h)**2)
+        # Inter-Ocular Distance (IOD) for scale-invariant normalization
+        # Landmarks 33 (left eye outer) and 263 (right eye outer)
+        p33, p263 = landmarks[33], landmarks[263]
+        iod = np.sqrt(((p33.x - p263.x) * w)**2 + ((p33.y - p263.y) * h)**2)
         
-        return h_dist / (w_dist + 1e-6)
+        return h_dist / (iod + 1e-6)
+
 
     def extract_mouth_signal(self, video_path, max_frames=500):
         """Extract time series of mouth openness from video."""
@@ -65,7 +67,7 @@ class LipSyncAnalyzer:
             if result.face_landmarks:
                 mouth_openness.append(self.compute_mouth_openness(result.face_landmarks[0], frame.shape))
             else:
-                mouth_openness.append(0.0)
+                mouth_openness.append(np.nan)  # Mark missing frames for interpolation
         
         cap.release()
         return np.array(mouth_openness), fps
@@ -89,18 +91,28 @@ class LipSyncAnalyzer:
             m = mouth_signal[:min_len]
             a = audio_energy[:min_len]
             
+            # Interpolate NaN values from missing face detections
+            nan_mask = np.isnan(m)
+            if nan_mask.all():
+                return None  # No face detected in any frame
+            if nan_mask.any():
+                valid_idx = np.where(~nan_mask)[0]
+                m = np.interp(np.arange(len(m)), valid_idx, m[valid_idx])
+            
             # Standardize for correlation
             m = (m - np.mean(m)) / (np.std(m) + 1e-8)
             a = (a - np.mean(a)) / (np.std(a) + 1e-8)
             
             # 4. Lag-Aware Best Correlation (Window +/- 5 frames)
             # This accounts for natural speech leads or encoding delays
-            max_corr = 0
+            max_corr = -np.inf
             for lag in range(-5, 6):
                 if lag < 0:
-                    c = np.mean(m[-lag:] * a[:lag])
+                    # Negative lag: audio leads mouth by |lag| frames
+                    c = np.mean(m[:lag] * a[-lag:])
                 elif lag > 0:
-                    c = np.mean(m[:-lag] * a[lag:])
+                    # Positive lag: mouth leads audio by |lag| frames
+                    c = np.mean(m[lag:] * a[:-lag])
                 else:
                     c = np.mean(m * a)
                 max_corr = max(max_corr, c)

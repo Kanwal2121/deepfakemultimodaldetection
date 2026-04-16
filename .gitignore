@@ -11,8 +11,7 @@ venv/
 ENV/
 
 # Large Files (Models & Data)
-*.h5
-*.keras
+
 *.csv
 FaceForensics++_C23/
 FakeAVCeleb/

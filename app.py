@@ -12,11 +12,13 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import tensorflow as tf
+
 
 # ── Page config (must be first Streamlit call) ────────────────────
 st.set_page_config(
     page_title=" Deepfake Forensic System ",
-    page_icon="🔬",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -28,26 +30,78 @@ if css_path.exists():
 
 
 # ══════════════════════════════════════════════════════════════════
+#  Custom Keras Objects (Required for loading pre-trained models)
+# ══════════════════════════════════════════════════════════════════
+
+class FocalLoss(tf.keras.losses.Loss):
+    def __init__(self, gamma=2.0, alpha=0.75, label_smoothing=0.05, **kwargs):
+        super().__init__(**kwargs)
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        if self.label_smoothing > 0:
+            y_true = y_true * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        bce = -(y_true * tf.math.log(y_pred) + (1 - y_true) * tf.math.log(1 - y_pred))
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        focal_weight = tf.pow(1.0 - p_t, self.gamma)
+        alpha_t = y_true * self.alpha + (1 - y_true) * (1 - self.alpha)
+        return tf.reduce_mean(alpha_t * focal_weight * bce)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"gamma": self.gamma, "alpha": self.alpha, "label_smoothing": self.label_smoothing})
+        return config
+
+
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, initial_lr, warmup_steps, total_steps, min_lr=1e-7, **kwargs):
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_lr = self.initial_lr * (step / tf.maximum(self.warmup_steps, 1.0))
+        decay_steps = tf.maximum(self.total_steps - self.warmup_steps, 1.0)
+        cosine_decay = 0.5 * (1.0 + tf.cos(np.pi * (step - self.warmup_steps) / decay_steps))
+        decay_lr = self.min_lr + (self.initial_lr - self.min_lr) * cosine_decay
+        return tf.where(step < self.warmup_steps, warmup_lr, decay_lr)
+
+    def get_config(self):
+        return {"initial_lr": self.initial_lr, "warmup_steps": self.warmup_steps, "total_steps": self.total_steps, "min_lr": self.min_lr}
+
+
+
+# ══════════════════════════════════════════════════════════════════
 #  Lazy loading of heavy modules (keeps app startup fast)
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner="Loading forensic experts…")
 def load_experts():
     """Load all ML models once and cache them."""
-    import tensorflow as tf
     from lip_sync_analyzer import LipSyncAnalyzer
+
 
     def _load(paths):
         for p in paths:
             if os.path.exists(p):
                 try:
-                    return tf.keras.models.load_model(p), p
-                except Exception:
+                    custom_objects = {"FocalLoss": FocalLoss, "WarmupCosineDecay": WarmupCosineDecay}
+                    return tf.keras.models.load_model(p, custom_objects=custom_objects, compile=False), p
+                except Exception as e:
+
+                    print(f"Error loading {p}: {e}")
                     continue
         return None, None
 
     vis_model, vis_path = _load([
-        "visual_expert_best.keras",
+        "visual_expert_best.keras"
     ])
     aud_model, aud_path = _load([
         "audio_expert_best.keras", "audio_expert_best.h5",
@@ -123,14 +177,15 @@ def run_full_analysis(video_path, vis_model, aud_model, sync_analyzer, calibrati
     else:
         conf_v = _confidence(vis_prob)
         conf_a = _confidence(aud_prob)
-        conf_s = max(0.1, abs(sync_score - 0.5) * 2)
-        conf_f = max(0.1, abs(freq_anomaly - 0.5) * 2)
+        conf_s = _confidence(sync_score)
+        conf_f = _confidence(1.0 - freq_anomaly)
         total = conf_v + conf_a + conf_s + conf_f + 1e-8
         w_v = conf_v / total
         w_a = conf_a / total
         w_s = conf_s / total
         w_f = conf_f / total
         fused = w_v * vis_prob + w_a * aud_prob + w_s * sync_score + w_f * (1.0 - freq_anomaly)
+
 
     fused_thr = float(calibration.get("fusion_real_threshold", 0.5))
     final_verdict = "REAL" if fused >= fused_thr else "FAKE"
@@ -224,7 +279,7 @@ def main():
         """
         <div style="text-align:center;padding:1rem 0 0.5rem;">
             <h1 style="font-size:2.8rem;margin-bottom:0.2rem;">
-                🔬 VeriSync Forensic Lab
+                 VeriSync Forensic Lab
             </h1>
             <p style="color:#94a3b8;font-size:1.1rem;margin-top:0;">
                 Multi-Modal Deepfake Detection · Visual · Audio · Lip-Sync · Frequency
@@ -269,7 +324,7 @@ def main():
         video_path = tmp.name
 
     # ── Wait for button click ─────────────────────────────
-    if st.button("🚀 Run Forensic Analysis", type="primary", use_container_width=True):
+    if st.button(" Run Forensic Analysis", type="primary", width="stretch"):
         # ── Load models ───────────────────────────────────────
         vis_model, vis_path, aud_model, aud_path, sync_analyzer, calibration = load_experts()
 
@@ -282,10 +337,10 @@ def main():
 
             _render_results(report, uploaded.name, video_path)
 
-            # Cleanup
+            # Cleanup temp file after analysis is fully rendered
             try:
                 os.unlink(video_path)
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -297,10 +352,10 @@ def _render_landing():
     st.markdown("<br>", unsafe_allow_html=True)
     cols = st.columns(4)
     features = [
-        ("🧠", "Visual Expert", "EfficientNetV2B0 + BiGRU + Multi-Head Attention for temporal face analysis"),
-        ("🎵", "Audio Expert", "Mel-spectrogram analysis with pretrained CNN to detect synthetic speech"),
-        ("👄", "Lip-Sync Check", "MediaPipe landmark tracking correlated with audio energy envelope"),
-        ("📊", "Frequency Analysis", "DCT & FFT spectral forensics to detect GAN-generated artifacts"),
+        ("", "Visual Expert", "EfficientNetV2B0 + BiGRU + Multi-Head Attention for temporal face analysis"),
+        ("", "Audio Expert", "Mel-spectrogram analysis with pretrained CNN to detect synthetic speech"),
+        ("", "Lip-Sync Check", "MediaPipe landmark tracking correlated with audio energy envelope"),
+        ("", "Frequency Analysis", "DCT & FFT spectral forensics to detect GAN-generated artifacts"),
     ]
     for col, (icon, title, desc) in zip(cols, features):
         with col:
@@ -349,7 +404,7 @@ def _render_results(report, filename, video_path):
         fake_prob_vis = 1.0 - scores["visual"]
         st.plotly_chart(
             make_gauge(fake_prob_vis, "Video Manipulation", is_real_prob=False),
-            use_container_width=True, key="gauge_vis",
+            width="stretch", key="gauge_vis",
         )
         verdict_color = "#10b981" if fake_prob_vis < 0.5 else "#ef4444"
         st.markdown(
@@ -369,7 +424,7 @@ def _render_results(report, filename, video_path):
             fake_prob_aud = 1.0 - scores["audio"]
             st.plotly_chart(
                 make_gauge(fake_prob_aud, "Audio Manipulation", is_real_prob=False),
-                use_container_width=True, key="gauge_aud",
+                width="stretch", key="gauge_aud",
             )
             vc = "#10b981" if fake_prob_aud < 0.5 else "#ef4444"
             st.markdown(
@@ -389,7 +444,7 @@ def _render_results(report, filename, video_path):
             fake_prob_sync = 1.0 - scores["lip_sync"]
             st.plotly_chart(
                 make_gauge(fake_prob_sync, "Lip-Sync Mismatch", is_real_prob=False),
-                use_container_width=True, key="gauge_sync",
+                width="stretch", key="gauge_sync",
             )
             vc = "#10b981" if fake_prob_sync < 0.5 else "#ef4444"
             st.markdown(
@@ -401,7 +456,7 @@ def _render_results(report, filename, video_path):
     with gauge_cols[3]:
         st.plotly_chart(
             make_gauge(scores["frequency_anomaly"], "Frequency Anomaly", is_real_prob=False),
-            use_container_width=True, key="gauge_freq",
+            width="stretch", key="gauge_freq",
         )
         vc = "#10b981" if verdicts["frequency"] == "CLEAN" else "#f59e0b"
         st.markdown(
@@ -414,7 +469,7 @@ def _render_results(report, filename, video_path):
 
     # ── Tabbed Deep-Dive ──────────────────────────────────
     tab_frames, tab_gradcam, tab_freq, tab_spec, tab_report = st.tabs([
-        "🎞️ Face Crops", "🔥 Grad-CAM", "📊 Frequency", "🎵 Spectrogram", "📋 Full Report",
+        " Face Crops", "Grad-CAM", "Frequency", "Spectrogram", "Full Report",
     ])
 
     # ── Tab 1: Face crops ─────────────────────────────────
@@ -427,7 +482,7 @@ def _render_results(report, filename, video_path):
                     frame = report["faces"][i]
                     if frame.max() > 1:
                         frame = frame.astype(np.uint8)
-                    st.image(frame, caption=f"Frame {i+1}", use_container_width=True)
+                    st.image(frame, caption=f"Frame {i+1}", width="stretch")
         face_cols2 = st.columns(5)
         for i, col in enumerate(face_cols2):
             with col:
@@ -436,11 +491,11 @@ def _render_results(report, filename, video_path):
                     frame = report["faces"][idx]
                     if frame.max() > 1:
                         frame = frame.astype(np.uint8)
-                    st.image(frame, caption=f"Frame {idx+1}", use_container_width=True)
+                    st.image(frame, caption=f"Frame {idx+1}", width="stretch")
 
     # ── Tab 2: Grad-CAM ──────────────────────────────────
     with tab_gradcam:
-        st.markdown("#### 🔥 Grad-CAM Attention Heatmaps")
+        st.markdown("####Grad-CAM Attention Heatmaps")
         st.caption("Highlighted regions show where the model focuses to detect manipulation")
 
         try:
@@ -460,7 +515,7 @@ def _render_results(report, filename, video_path):
                                 if orig.max() > 1:
                                     orig = orig.astype(np.uint8)
                                 overlay = overlay.astype(np.uint8)
-                                st.image(overlay, caption=f"Frame {idx+1}", use_container_width=True)
+                                st.image(overlay, caption=f"Frame {idx+1}", width="stretch")
             else:
                 st.warning("Visual model not loaded — cannot generate Grad-CAM.")
         except Exception as e:
@@ -468,7 +523,7 @@ def _render_results(report, filename, video_path):
 
     # ── Tab 3: Frequency analysis ─────────────────────────
     with tab_freq:
-        st.markdown("#### 📊 Spectral Forensics")
+        st.markdown("####Spectral Forensics")
 
         freq_col1, freq_col2 = st.columns(2)
         with freq_col1:
@@ -494,14 +549,14 @@ def _render_results(report, filename, video_path):
                        "gridcolor": "rgba(255,255,255,0.05)"},
                 height=350, margin=dict(l=40, r=20, t=20, b=40),
             )
-            st.plotly_chart(fig_freq, use_container_width=True)
+            st.plotly_chart(fig_freq, width="stretch")
 
         with freq_col2:
             st.markdown("**Frequency Spectrum (Sample Frame)**")
             try:
                 from frequency_analyzer import generate_frequency_spectrum_image
                 spec_img = generate_frequency_spectrum_image(report["faces"][0])
-                st.image(spec_img, caption="2D FFT Magnitude Spectrum", use_container_width=True)
+                st.image(spec_img, caption="2D FFT Magnitude Spectrum", width="stretch")
             except Exception as e:
                 st.warning(f"Could not generate spectrum: {e}")
 
@@ -519,11 +574,11 @@ def _render_results(report, filename, video_path):
                     f"{fs.get('spectral_entropy', 0):.2f}",
                 ],
             }
-            st.dataframe(pd.DataFrame(feat_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(feat_data), width="stretch", hide_index=True)
 
     # ── Tab 4: Spectrogram ────────────────────────────────
     with tab_spec:
-        st.markdown("#### 🎵 Audio Mel-Spectrogram")
+        st.markdown("####  Audio Mel-Spectrogram")
         if report["is_silent"]:
             st.info("Audio is silent — no spectrogram to display.")
         else:
@@ -542,15 +597,15 @@ def _render_results(report, filename, video_path):
                 yaxis={"title": "Mel Frequency Bin"},
                 height=350, margin=dict(l=60, r=20, t=20, b=50),
             )
-            st.plotly_chart(fig_spec, use_container_width=True)
+            st.plotly_chart(fig_spec, width="stretch")
 
     # ── Tab 5: Full JSON Report ───────────────────────────
     with tab_report:
-        st.markdown("#### 📋 Forensic Evidence Report")
+        st.markdown("###Forensic Evidence Report")
 
         export_report = {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "filename": filename if 'filename' in dir() else "unknown",
+            "filename": filename,
             "scores": report["scores"],
             "thresholds": report["thresholds"],
             "verdicts": report["verdicts"],
@@ -561,7 +616,7 @@ def _render_results(report, filename, video_path):
         st.json(export_report)
 
         st.download_button(
-            label="📥 Download JSON Report",
+            label="Download JSON Report",
             data=json.dumps(export_report, indent=2),
             file_name=f"verisync_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
@@ -572,5 +627,5 @@ def _render_results(report, filename, video_path):
 #  Entry point
 # ══════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    main()
+# Streamlit runs scripts directly (not via __main__), so call unconditionally
+main()
